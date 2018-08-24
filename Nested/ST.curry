@@ -1,0 +1,252 @@
+{-# OPTIONS_FRONTEND -W no-incomplete-patterns #-}
+
+--- This module defines the structure and some generic operations
+--- for search trees.
+
+module ST where
+
+import Findall (allValues)
+
+--------------------------------------------------------------------------------
+
+--- Does the HNF computation of the argument fail?
+isFail :: a -> Bool
+isFail x = null (allValues (x `seq` ()))
+
+--------------------------------------------------------------------------------
+
+--- Data type to represent search trees where failures or choices can be
+--- inside or outside.
+--- Note that the actual values are head normal forms.
+--- The evaluation to normal form will be done when a set functions
+--- returns a value set.
+data ST a = Val a                    -- a value (in head normal form)
+          | Uneval a                 -- an unevaluated value from outside
+          | Fail Int                 -- failure with level
+          | Choice Int (ST a) (ST a) -- non-deterministic choice with level
+
+-- Generic operation to apply a non-deterministic operation defined
+-- on a single head normal form to a search tree.
+applyST :: (a -> ST b) -> ST a -> ST b
+applyST f (Val x)          = f x
+applyST f (Uneval x)       = if isFail x then Fail 0 else f x
+applyST _ (Fail l)         = Fail l
+applyST f (Choice l s1 s2) = Choice l (f `applyST` s1) (f `applyST` s2)
+
+--------------------------------------------------------------------------------
+
+--- A type with the `NF` property must provide a method `nf`
+--- to evaluate an expression in head normal form into a search tree
+--- where all `Val` arguments are fully evaluated, i.e., do not
+--- contain choices or failures in subterms.
+class NF a where
+  nf :: a -> ST a
+
+-- This operation extends the operation `nf` on search trees.
+nfST :: NF a => ST a -> ST a
+nfST (Val x)          = nf x
+nfST (Uneval x)       = if isFail x then Fail 0 else x `seq` nf x
+nfST (Fail l)         = Fail l
+nfST (Choice l s1 s2) = Choice l (nfST s1) (nfST s2)
+
+-- Some `NF` instances for base types.
+instance NF Int where
+  nf x = Val x
+
+instance NF Bool where
+  nf x = Val x
+
+instance NF Char where
+  nf x = Val x
+
+--------------------------------------------------------------------------------
+
+--- The head normal form of a list structure with non-deterministic components.
+data STList a = Nil | Cons (ST a) (ST (STList a))
+
+instance NF a => NF (STList a) where
+  nf Nil           = Val Nil
+  nf (Cons sx sxs) = case nfST sx of
+    Choice l s1 s2 -> Choice l (nfST (Val (Cons s1 sxs)))
+                               (nfST (Val (Cons s2 sxs)))
+    Fail l         -> Fail l
+    sy             -> case nfST sxs of
+      Choice l s1 s2 -> Choice l (nfST (Val (Cons sy s1)))
+                                 (nfST (Val (Cons sy s2)))
+      Fail l         -> Fail l
+      sys            -> Val (Cons sy sys)
+
+--------------------------------------------------------------------------------
+
+--- Computes the list of all values (normal forms) represented in a search tree.
+stValues :: NF a => ST a -> [a]
+stValues = searchDFS . nfST
+
+--- Searches all values in a search tree by a depth-first search strategy.
+--- Outside failures lead to a failure only if there is no other value.
+searchDFS :: ST a -> [a]
+searchDFS st = maybe failed id (searchDFS' st)
+ where
+  searchDFS' (Val x)          = Just [x]
+  searchDFS' (Fail l)         = if l == 0 then Nothing else Just []
+  searchDFS' (Choice _ s1 s2) = concVals (searchDFS' s1) (searchDFS' s2)
+
+  concVals Nothing   ys = ys
+  concVals (Just xs) ys = Just (xs ++ maybe [] id ys)
+
+--- Computes the non-deterministic list of all values (normal forms)
+--- represented in a search tree.
+stValuesP :: NF a => Int -> ST a -> ST (STList a)
+stValuesP n = searchDFSP n . nfST
+
+-- Computes the list of all normal forms of a search tree value.
+-- The first argument is the encapsulation level so that
+-- failures and non-determinism outside this level are not encapsulated.
+searchDFSP :: NF a => Int -> ST a -> ST (STList a)
+searchDFSP _ (Val x)          = Val (Cons (Val x) (Val Nil))
+searchDFSP l (Fail n)         = if n == l then Val Nil else Fail n
+searchDFSP l (Choice n s1 s2) =
+  if n == l then concValsP (searchDFSP l s1) (searchDFSP l s2)
+            else Choice n (searchDFSP l s1) (searchDFSP l s2)
+
+concValsP :: ST (STList a) -> ST (STList a) -> ST (STList a)
+concValsP (Val Nil)           sys              = sys
+concValsP (Val (Cons sx sxs)) sys              =
+  Val (Cons sx (concValsP sxs (getValuesP sys)))
+concValsP (Choice n s1 s2)    sys              =
+  Choice n (concValsP s1 sys) (concValsP s2 sys)
+concValsP (Fail _)            sy@(Val _)       = sy
+concValsP (Fail n)            (Fail m)         = Fail (max n m)
+concValsP (Fail n)            (Choice m s1 s2) =
+  Choice m (concValsP (Fail n) s1) (concValsP (Fail n) s2)
+
+-- Removes failures from a list.
+getValuesP :: ST (STList a) -> ST (STList a)
+getValuesP (Val x)          = Val x
+getValuesP (Fail _)         = Val Nil
+getValuesP (Choice l s1 s2) = Choice l (getValuesP s1) (getValuesP s2)
+
+--------------------------------------------------------------------------------
+
+-- The following multiparameter type class is what we would wish for in
+-- order to realize an elegant automatic transformation of programs.
+-- 
+-- class ConvertST a b where
+--   toValST :: a -> b
+--   fromValST :: b -> a
+--
+-- The method `toValST` converts a Curry value to its ST representation.
+-- 'fromValST` converts a value in ST representation back to
+-- its corresponding Curry value. When converting a Curry value to its
+-- ST representation, we wrap constructor arguments in an `Uneval`
+-- constructor, which is done by using the `toST` function introduced
+-- later. This way we can ensure that we do not evaluate Curry expressions
+-- that are not demanded.
+-- We would have to provide instances of the multiparameter type class for
+-- each data type and its translation, e.g., the following instances.
+--
+-- instance ConvertST Int Int
+-- instance ConvertST a b => ConvertST [a] (STList b)
+--
+-- However, since Curry currently does not support multiparameter type
+-- classes we have to provide specialized implementations of its methods.
+--
+-- In the following we provide these specialized implementations for the
+-- aforementioned instances.
+
+toValST_Int_Int :: Int -> Int
+toValST_Int_Int = id
+
+fromValST_Int_Int :: Int -> Int
+fromValST_Int_Int = id
+
+toValST_Bool_Bool :: Bool -> Bool
+toValST_Bool_Bool = id
+
+fromValST_Bool_Bool :: Bool -> Bool
+fromValST_Bool_Bool = id
+
+toValST_List_STList :: (a -> ST b) -> [a] -> STList b
+toValST_List_STList _        []     = Nil
+toValST_List_STList toST_a_b (x:xs) =
+  Cons (toST_a_b x) (toST_List_STList toST_a_b xs)
+
+fromValST_List_STList :: (a -> b) -> STList a -> [b]
+fromValST_List_STList _              Nil                     = []
+fromValST_List_STList fromValST_b_a (Cons (Val x) (Val xs)) =
+  fromValST_b_a x : fromValST_List_STList fromValST_b_a xs
+
+--------------------------------------------------------------------------------
+
+-- We further need a function that returns a search tree representation of
+-- a Curry value by wrapping the value translated into its ST representation
+-- in an `Uneval` constructor. Aside from the use in `toValST` we will need
+-- this functionality when calling a set function where we wrap every arguments
+-- this way.
+--
+-- toST :: ConvertST a b => a -> ST b
+-- toST = Uneval . toValST
+--
+-- Because we do not have the multiparameter type class `ConvertST` available
+-- in Curry, we have to provide specialized implementations of this
+-- overloaded function.
+
+toST_Int_Int :: Int -> ST Int
+toST_Int_Int = Uneval . toValST_Int_Int
+
+toST_Bool_Bool :: Bool -> ST Bool
+toST_Bool_Bool = Uneval . toValST_Bool_Bool
+
+toST_List_STList :: (a -> ST b) -> [a] -> ST (STList b)
+toST_List_STList toST_a_b = Uneval . toValST_List_STList toST_a_b
+
+--------------------------------------------------------------------------------
+
+-- For simplicity, we represent multisets of values as lists.
+type Values a = [a]
+
+-- Also, we need a function that translates a search tree representation
+-- to the multiset of its Curry values.
+--
+-- fromST :: (ConvertST a b, NF b) => ST b -> Values a
+-- fromST = map fromValST . stValues
+
+-- Like before, we have to provide specialized implementations of this
+-- overloaded function.
+
+fromST_Int_Int :: ST Int -> Values Int
+fromST_Int_Int = map fromValST_Int_Int . stValues
+
+fromST_Bool_Bool :: ST Bool -> Values Bool
+fromST_Bool_Bool = map fromValST_Bool_Bool . stValues
+
+fromST_List_STList :: NF a => (a -> b) -> ST (STList a) ->  Values [b]
+fromST_List_STList fromValST_b_a =
+  map (fromValST_List_STList fromValST_b_a) . stValues
+
+--------------------------------------------------------------------------------
+
+-- Sometimes it is helpful to lift functions on base types
+-- to plural functions. Note that these operations are only
+-- applicable to strict and knowingly determinstic functions
+-- that don't produce failures.
+-- For this reason, we omit the additional encapsulation level
+-- parameter in their lifted form.
+
+--- Lifts a unary function into a plural function.
+lift1P :: (a -> b) -> ST a -> ST b
+lift1P f sx = (Val . f) `applyST` sx
+
+--- Lifts a binary function into a plural function.
+lift2P :: (a -> b -> c) -> ST a -> ST b -> ST c
+lift2P f sx sy = lift2X `applyST` sx
+ where lift2X x = lift2XY `applyST` sy
+        where lift2XY y = Val (f x y)
+
+--- Lifts a ternary function into a plural function.
+lift3P :: (a -> b -> c -> d) -> ST a -> ST b -> ST c -> ST d
+lift3P f sx sy sz = lift3X `applyST` sx
+ where lift3X x = lift3XY `applyST` sy
+        where lift3XY y = lift3XYZ `applyST` sz
+               where lift3XYZ z = Val (f x y z)
+
